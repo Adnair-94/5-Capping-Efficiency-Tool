@@ -1,0 +1,52 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  build-windows:
+    runs-on: windows-2022
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Build executable with PyInstaller
+        run: >
+          pyinstaller
+          --noconfirm
+          --clean
+          --onefile
+          --windowed
+          --name "RNA_Forge_Capping_Efficiency_Tool"
+          --add-data "capping_species_template.csv;."
+          --hidden-import pyteomics.mzml
+          --hidden-import pyteomics.mzxml
+          --hidden-import PySide6.QtWebEngineWidgets
+          --hidden-import PySide6.QtWebEngineCore
+          --hidden-import PySide6.QtWebChannel
+          --collect-all pyteomics
+          --collect-all plotly
+          --collect-all PySide6
+          main.py
+
+      - name: Upload EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RNA_Forge_Capping_Efficiency_Tool_Windows_EXE
+          path: dist/RNA_Forge_Capping_Efficiency_Tool.exe
