@@ -11,6 +11,15 @@ python -m PyInstaller ^
   --onefile ^
   --windowed ^
   --name "RNA_Forge_Capping_Efficiency_Tool" ^
+  --add-data "capping_species_template.csv;." ^
+  --hidden-import pyteomics.mzml ^
+  --hidden-import pyteomics.mzxml ^
+  --hidden-import PySide6.QtWebEngineWidgets ^
+  --hidden-import PySide6.QtWebEngineCore ^
+  --hidden-import PySide6.QtWebChannel ^
+  --collect-all pyteomics ^
+  --collect-all plotly ^
+  --collect-all PySide6 ^
   main.py
 
 if errorlevel 1 (

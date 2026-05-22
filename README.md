@@ -1,50 +1,50 @@
-# RNA Forge 5′ Capping Efficiency Desktop Tool
+# RNA Forge 5' Capping Efficiency Tool — desktop version
 
-This is a Python/PySide6 desktop translation of the working single-file Shiny `app.R` for LC-MS-based 5′ capping efficiency analysis.
+This is a Python/PySide6 desktop translation of the Shiny app.R logic for LC-MS-based 5' capping efficiency analysis.
 
-## What is preserved from app.R
+## Version 2 notes
 
-- `.mzML` and `.mzXML` input
-- user-defined capped and uncapped species table
-- CSV/XLSX species-table upload and validation
-- preset and custom species generation
-- per-row `mz_tol`, optional `ms2_mz`, and `ms2_window_sec`
-- MS1 EIC extraction
-- optional MS2 confirmation near the MS1 apex
-- interactive RT-window selection
-- trapezoidal MS1 AUC integration
-- capping efficiency calculation from summed capped and uncapped AUCs
-- RT-window CSV export and AUC-table CSV export
+This version fixes three practical problems from the first desktop port:
 
-## Important implementation note
+1. The GUI is reorganized into panes and tabs instead of a compressed single sidebar.
+2. The EIC viewer uses embedded Plotly via Qt WebEngine, so box/lasso selection is closer to the original Shiny/plotly workflow.
+3. PyInstaller build commands explicitly bundle Pyteomics, Plotly, and PySide6 WebEngine components.
 
-The pasted app.R creates a `use_for_efficiency` flag and labels the G-only ladder as diagnostic by default, but the R `capEff` block does not actually use the flag when calculating capping efficiency. This desktop version honors `use_for_efficiency` by default because that is the intended denominator-control behavior. The core function `calculate_efficiency(..., honor_use_for_efficiency=False)` can reproduce the literal R behavior if needed.
+## Install for local development
 
-## Development install
-
-```bat
-python -m venv .venv
-.venv\Scripts\activate
-python -m pip install --upgrade pip
+```bash
 python -m pip install -r requirements.txt
 python main.py
 ```
 
-## Build onefile Windows executable
+## Build on Windows
 
 ```bat
 build_windows.bat
 ```
 
-The executable will be created in `dist\RNA_Forge_Capping_Efficiency_Tool.exe`.
+The `.exe` will be created in the `dist` folder.
 
-## Clean-machine testing order
+## Recommended GitHub Actions build
 
-1. Test `capping_core.py` alone using a known mzML/mzXML and species table.
-2. Compare numerical AUC and capping efficiency against the Shiny app.R output.
-3. Compare EIC plots visually against app.R.
-4. Test CSV, Excel, TIFF, and ZIP exports.
-5. Test the GUI workflow on the build machine.
-6. Build the onefile `.exe`.
-7. Test the `.exe` on the build machine.
-8. Test the `.exe` on a clean Windows machine with no R/Python installation.
+The workflow file is included at:
+
+```text
+.github/workflows/build-windows-exe.yml
+```
+
+Push the files to GitHub, open the Actions tab, and run **Build Windows EXE**.
+
+## Important scientific behavior
+
+Capping efficiency is calculated as:
+
+```text
+sum(AUC_capped) / [sum(AUC_capped) + sum(AUC_uncapped)]
+```
+
+This Python implementation honors the `use_for_efficiency` flag. Species marked as diagnostic-only, such as the G-only ladder by default, are not included in the efficiency denominator unless `use_for_efficiency = TRUE`.
+
+## mzML/mzXML support
+
+mzML and mzXML parsing requires `pyteomics`. If the executable reports that Pyteomics is missing, rebuild using the included `build_windows.bat` or GitHub Actions workflow, because the first build likely did not bundle hidden Pyteomics imports.
