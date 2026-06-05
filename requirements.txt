@@ -1,8 +1,0 @@
-pandas
-numpy
-matplotlib
-openpyxl
-xlsxwriter
-PySide6
-plotly
-pyinstaller
