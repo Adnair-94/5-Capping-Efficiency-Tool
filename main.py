@@ -1,0 +1,1285 @@
+"""PySide6 desktop GUI for the RNA Forge 5' Capping Efficiency Tool.
+
+Version 13 changes:
+- Added numeric RT-window entry as an alternative to Plotly box/lasso selection.
+- Added analysis/plot species selection controls for excluding unwanted species/signals.
+- Added editable composite-plot axis ranges so users can focus on useful RT/intensity regions.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+import tempfile
+import html as html_lib
+from pathlib import Path
+from typing import Optional
+
+import pandas as pd
+
+from PySide6.QtCore import Qt, QUrl
+from PySide6.QtGui import QColor, QPalette
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QFileDialog,
+    QFormLayout,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QProgressDialog,
+    QScrollArea,
+    QSpinBox,
+    QDoubleSpinBox,
+    QSplitter,
+    QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
+
+try:
+    from PySide6.QtWebEngineWidgets import QWebEngineView
+    WEBENGINE_AVAILABLE = True
+except Exception:  # pragma: no cover - only used when QtWebEngine is unavailable
+    QWebEngineView = None
+    WEBENGINE_AVAILABLE = False
+
+from capping_core import (
+    SPECIES_COLUMNS,
+    AnalysisSession,
+    auc_table,
+    intensity_table,
+    build_analysis,
+    calculate_efficiency,
+    cap_presets,
+    default_species,
+    generate_custom_species,
+    generate_preset_species,
+    composite_eic_data,
+    read_species_file,
+    save_rt_window,
+    species_template,
+    validate_species_table,
+)
+from capping_exports import (
+    export_all_eic_tiffs_zip,
+    export_csv,
+    export_current_eic_tiff,
+    export_composite_eic_tiff,
+    export_excel_workbook,
+)
+
+
+APP_NAME = "RNA Forge 5' Capping Efficiency Tool"
+
+
+def safe_filename(text: str) -> str:
+    return "".join(c if c.isalnum() or c in "._-" else "_" for c in str(text))
+
+
+class CappingEfficiencyWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(APP_NAME)
+        self.resize(1650, 950)
+
+        self.ms_file: Optional[str] = None
+        self.species_df: pd.DataFrame = default_species()
+        self.session: Optional[AnalysisSession] = None
+        self._plot_temp_dir = Path(tempfile.mkdtemp(prefix="rna_forge_eic_"))
+        self._plot_counter = 0
+        self._updating_selection_table = False
+
+        self._build_ui()
+        self._load_species_table(self.species_df)
+        self._set_status(
+            "Using default species table. Upload/generate species, select an MS file, then click 'Load Data & Build EICs'."
+        )
+        self._show_blank_plot("No MS data loaded")
+        self.refresh_tables()
+
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
+    def _build_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QHBoxLayout(central)
+
+        splitter = QSplitter(Qt.Horizontal)
+        root.addWidget(splitter)
+
+        left = QWidget()
+        left.setMinimumWidth(460)
+        left.setMaximumWidth(620)
+        left_layout = QVBoxLayout(left)
+        splitter.addWidget(left)
+
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+        splitter.addWidget(right)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+
+        # Input and run controls kept visible at the top.
+        input_group = QGroupBox("MS input and analysis")
+        input_layout = QGridLayout(input_group)
+        self.ms_label = QLabel("No MS file selected")
+        self.ms_label.setWordWrap(True)
+        choose_ms_btn = QPushButton("Choose .mzML or .mzXML file")
+        choose_ms_btn.clicked.connect(self.choose_ms_file)
+        load_btn = QPushButton("Load Data && Build EICs")
+        load_btn.clicked.connect(self.load_ms_data)
+
+        self.default_mz_tol = QDoubleSpinBox()
+        self.default_mz_tol.setDecimals(5)
+        self.default_mz_tol.setRange(0.00001, 10.0)
+        self.default_mz_tol.setSingleStep(0.001)
+        self.default_mz_tol.setValue(0.01)
+
+        self.default_ms2_window = QDoubleSpinBox()
+        self.default_ms2_window.setDecimals(1)
+        self.default_ms2_window.setRange(0.1, 10000.0)
+        self.default_ms2_window.setSingleStep(1.0)
+        self.default_ms2_window.setValue(30.0)
+
+        self.ms1_intensity_threshold = QDoubleSpinBox()
+        self.ms1_intensity_threshold.setDecimals(1)
+        self.ms1_intensity_threshold.setRange(0.0, 1e12)
+        self.ms1_intensity_threshold.setSingleStep(1000.0)
+        self.ms1_intensity_threshold.setValue(5000.0)
+
+        self.auc_min_intensity = QDoubleSpinBox()
+        self.auc_min_intensity.setDecimals(1)
+        self.auc_min_intensity.setRange(0.0, 1e12)
+        self.auc_min_intensity.setSingleStep(1000.0)
+        self.auc_min_intensity.setValue(5000.0)
+
+        self.min_consecutive_points = QSpinBox()
+        self.min_consecutive_points.setRange(2, 100)
+        self.min_consecutive_points.setSingleStep(1)
+        self.min_consecutive_points.setValue(6)
+
+        self.ignore_labile_loss = QCheckBox("Ignore co-eluted labile phosphate-loss species")
+        self.ignore_labile_loss.setChecked(True)
+
+        self.labile_rt_tolerance = QDoubleSpinBox()
+        self.labile_rt_tolerance.setDecimals(1)
+        self.labile_rt_tolerance.setRange(0.0, 300.0)
+        self.labile_rt_tolerance.setSingleStep(1.0)
+        self.labile_rt_tolerance.setValue(5.0)
+
+        self.uncapped_percent_threshold = QDoubleSpinBox()
+        self.uncapped_percent_threshold.setDecimals(3)
+        self.uncapped_percent_threshold.setRange(0.0, 100.0)
+        self.uncapped_percent_threshold.setSingleStep(0.1)
+        self.uncapped_percent_threshold.setValue(1.0)
+
+        self.ignore_not_found_species = QCheckBox("Ignore species not found beyond limits in efficiency")
+        self.ignore_not_found_species.setChecked(True)
+
+        self.allow_bounded_efficiency = QCheckBox("Report >99%/<1% when one class is not detected")
+        self.allow_bounded_efficiency.setChecked(True)
+
+        self.combine_capped_charges = QCheckBox("Combine capped z=1/z=2 for efficiency and composite plot")
+        self.combine_capped_charges.setChecked(True)
+
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem("MS2-confirmed Only", "filtered")
+        self.mode_combo.addItem("All Species", "all")
+        self.mode_combo.currentIndexChanged.connect(self.refresh_after_mode_change)
+
+        self.rt_unit_combo = QComboBox()
+        self.rt_unit_combo.addItem("Seconds", "seconds")
+        self.rt_unit_combo.addItem("Minutes", "minutes")
+        self.rt_unit_combo.currentIndexChanged.connect(self.refresh_rt_unit_views)
+
+        input_layout.addWidget(choose_ms_btn, 0, 0, 1, 2)
+        input_layout.addWidget(load_btn, 0, 2, 1, 1)
+        input_layout.addWidget(self.ms_label, 1, 0, 1, 3)
+        input_layout.addWidget(QLabel("Default m/z tolerance (Th)"), 2, 0)
+        input_layout.addWidget(self.default_mz_tol, 2, 1)
+        input_layout.addWidget(QLabel("Default MS2 window (+/- sec)"), 3, 0)
+        input_layout.addWidget(self.default_ms2_window, 3, 1)
+        input_layout.addWidget(QLabel("MS1 confirmation threshold"), 4, 0)
+        input_layout.addWidget(self.ms1_intensity_threshold, 4, 1)
+        input_layout.addWidget(QLabel("AUC point min intensity"), 5, 0)
+        input_layout.addWidget(self.auc_min_intensity, 5, 1)
+        input_layout.addWidget(QLabel("Min contiguous points for peak"), 6, 0)
+        input_layout.addWidget(self.min_consecutive_points, 6, 1)
+        input_layout.addWidget(QLabel("Uncapped screen threshold (%)"), 7, 0)
+        input_layout.addWidget(self.uncapped_percent_threshold, 7, 1)
+        input_layout.addWidget(self.ignore_labile_loss, 8, 0, 1, 3)
+        input_layout.addWidget(QLabel("Labile co-elution tolerance (sec)"), 9, 0)
+        input_layout.addWidget(self.labile_rt_tolerance, 9, 1)
+        input_layout.addWidget(self.ignore_not_found_species, 10, 0, 1, 3)
+        input_layout.addWidget(self.allow_bounded_efficiency, 11, 0, 1, 3)
+        input_layout.addWidget(self.combine_capped_charges, 12, 0, 1, 3)
+        input_layout.addWidget(QLabel("Species mode"), 13, 0)
+        input_layout.addWidget(self.mode_combo, 13, 1, 1, 2)
+        input_layout.addWidget(QLabel("RT display unit"), 14, 0)
+        input_layout.addWidget(self.rt_unit_combo, 14, 1, 1, 2)
+        left_layout.addWidget(input_group)
+
+        self.left_tabs = QTabWidget()
+        left_layout.addWidget(self.left_tabs, stretch=1)
+        self._build_species_tab()
+        self._build_preset_tab()
+        self._build_custom_tab()
+        self._build_composite_tab()
+        self._build_exports_tab()
+
+        self.status_box = QTextEdit()
+        self.status_box.setReadOnly(True)
+        self.status_box.setMaximumHeight(120)
+        left_layout.addWidget(self.status_box)
+
+        # Right side: plot controls and Plotly view.
+        top_right = QHBoxLayout()
+        self.selected_species_combo = QComboBox()
+        self.selected_species_combo.currentIndexChanged.connect(self.plot_selected_species)
+        self.save_window_btn = QPushButton("Save selected RT window")
+        self.save_window_btn.clicked.connect(self.save_selected_window)
+        top_right.addWidget(QLabel("Selected species"))
+        top_right.addWidget(self.selected_species_combo, stretch=1)
+        top_right.addWidget(self.save_window_btn)
+        right_layout.addLayout(top_right)
+
+        numeric_rt_row = QHBoxLayout()
+        self.numeric_rt_label = QLabel("Manual RT window (seconds)")
+        self.numeric_rt_min = QDoubleSpinBox()
+        self.numeric_rt_min.setDecimals(4)
+        self.numeric_rt_min.setRange(0.0, 1e9)
+        self.numeric_rt_min.setSingleStep(1.0)
+        self.numeric_rt_max = QDoubleSpinBox()
+        self.numeric_rt_max.setDecimals(4)
+        self.numeric_rt_max.setRange(0.0, 1e9)
+        self.numeric_rt_max.setSingleStep(1.0)
+        self.save_numeric_window_btn = QPushButton("Save numeric RT window")
+        self.save_numeric_window_btn.clicked.connect(self.save_numeric_window)
+        numeric_rt_row.addWidget(self.numeric_rt_label)
+        numeric_rt_row.addWidget(QLabel("Min"))
+        numeric_rt_row.addWidget(self.numeric_rt_min)
+        numeric_rt_row.addWidget(QLabel("Max"))
+        numeric_rt_row.addWidget(self.numeric_rt_max)
+        numeric_rt_row.addWidget(self.save_numeric_window_btn)
+        right_layout.addLayout(numeric_rt_row)
+
+        self.plot_hint = QLabel(
+            "Use Plotly box/lasso selection or enter RT min/max numerically, then save the RT window. "
+            "The selected x-range is converted to seconds for storage/AUC. AUC uses only points above the intensity threshold and requires the minimum contiguous point count."
+        )
+        self.plot_hint.setWordWrap(True)
+        right_layout.addWidget(self.plot_hint)
+
+        if WEBENGINE_AVAILABLE:
+            self.plot_view = QWebEngineView()
+            right_layout.addWidget(self.plot_view, stretch=4)
+        else:
+            self.plot_view = QTextEdit()
+            self.plot_view.setReadOnly(True)
+            right_layout.addWidget(self.plot_view, stretch=4)
+            self._set_status("Qt WebEngine is unavailable. Plotly box/lasso selection cannot be used in this build.")
+
+        lower_tabs = QTabWidget()
+        self.rt_table = QTableWidget()
+        self.auc_table_widget = QTableWidget()
+        self.intensity_table_widget = QTableWidget()
+        self.selection_table = QTableWidget()
+        self.selection_table.itemChanged.connect(self.selection_table_changed)
+        lower_tabs.addTab(self.rt_table, "RT windows")
+        lower_tabs.addTab(self.auc_table_widget, "AUC table")
+        lower_tabs.addTab(self.intensity_table_widget, "Intensity summary")
+        lower_tabs.addTab(self.selection_table, "Analysis/plot selection")
+        right_layout.addWidget(lower_tabs, stretch=2)
+
+        self.efficiency_box = QTextEdit()
+        self.efficiency_box.setReadOnly(True)
+        self.efficiency_box.setMaximumHeight(105)
+        right_layout.addWidget(self.efficiency_box)
+
+    def _build_species_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        btn_row = QGridLayout()
+        upload_btn = QPushButton("Upload species table")
+        upload_btn.clicked.connect(self.upload_species_table)
+        template_btn = QPushButton("Save species template")
+        template_btn.clicked.connect(self.save_species_template)
+        reset_btn = QPushButton("Reset default")
+        reset_btn.clicked.connect(self.reset_species)
+        add_btn = QPushButton("Add row")
+        add_btn.clicked.connect(self.add_species_row)
+        remove_btn = QPushButton("Remove selected row")
+        remove_btn.clicked.connect(self.remove_selected_species_row)
+        btn_row.addWidget(upload_btn, 0, 0)
+        btn_row.addWidget(template_btn, 0, 1)
+        btn_row.addWidget(reset_btn, 1, 0)
+        btn_row.addWidget(add_btn, 1, 1)
+        btn_row.addWidget(remove_btn, 2, 0, 1, 2)
+        layout.addLayout(btn_row)
+        self.species_table = QTableWidget()
+        self.species_table.setColumnCount(len(SPECIES_COLUMNS))
+        self.species_table.setHorizontalHeaderLabels(SPECIES_COLUMNS)
+        self.species_table.itemChanged.connect(self._species_edited)
+        layout.addWidget(self.species_table, stretch=1)
+        self.left_tabs.addTab(tab, "Species table")
+
+    def _build_preset_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        form = QFormLayout()
+        self.preset_combo = QComboBox()
+        presets = cap_presets()
+        for _, row in presets.iterrows():
+            self.preset_combo.addItem(str(row["label"]), str(row["preset_id"]))
+        self.include_capped_z2 = QCheckBox("Include capped z = 2 ion")
+        self.include_capped_z2.setChecked(True)
+        self.include_uncapped_z2 = QCheckBox("Include uncapped z = 2 ladder")
+        self.include_g_ladder = QCheckBox("Include G-only pppG/ppG/pG ladder")
+        self.include_g_ladder.setChecked(True)
+        self.g_as_denominator = QCheckBox("Include G-only ladder in efficiency denominator")
+        self.generated_mode = QComboBox()
+        self.generated_mode.addItem("Replace table", "replace")
+        self.generated_mode.addItem("Append to table", "append")
+        load_preset_btn = QPushButton("Load preset species")
+        load_preset_btn.clicked.connect(self.load_preset_species)
+        form.addRow("Preset", self.preset_combo)
+        form.addRow("", self.include_capped_z2)
+        form.addRow("", self.include_uncapped_z2)
+        form.addRow("", self.include_g_ladder)
+        form.addRow("", self.g_as_denominator)
+        form.addRow("Generated species action", self.generated_mode)
+        layout.addLayout(form)
+        layout.addWidget(load_preset_btn)
+        layout.addStretch(1)
+        self.left_tabs.addTab(tab, "Preset generator")
+
+    def _build_custom_tab(self):
+        outer = QWidget()
+        outer_layout = QVBoxLayout(outer)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        inner = QWidget()
+        form = QFormLayout(inner)
+
+        self.custom_cap_name = QLineEdit("CustomCap")
+        self.custom_capped_mz = QDoubleSpinBox()
+        self.custom_capped_mz.setDecimals(5)
+        self.custom_capped_mz.setRange(0, 100000)
+        self.custom_capped_mz.setValue(0)
+        self.custom_capped_charge = QSpinBox()
+        self.custom_capped_charge.setRange(1, 20)
+        self.custom_capped_charge.setValue(1)
+        self.custom_fragment = QComboBox()
+        self.custom_fragment.addItems(["AG", "AUG", "G", "Custom"])
+        self.custom_ppp_mz = QDoubleSpinBox()
+        self.custom_ppp_mz.setDecimals(5)
+        self.custom_ppp_mz.setRange(0, 100000)
+        self.custom_ppp_mz.setValue(0)
+        self.custom_ppp_charge = QSpinBox()
+        self.custom_ppp_charge.setRange(1, 20)
+        self.custom_ppp_charge.setValue(1)
+        self.custom_include_capped_z2 = QCheckBox("Include calculated capped z = 2 ion")
+        self.custom_include_capped_z2.setChecked(True)
+        self.custom_include_uncapped_z2 = QCheckBox("Include uncapped z = 2 ladder")
+        self.custom_include_g_ladder = QCheckBox("Include G-only ladder")
+        self.custom_g_as_denominator = QCheckBox("Include G-only ladder in denominator")
+        gen_custom_btn = QPushButton("Generate custom species")
+        gen_custom_btn.clicked.connect(self.generate_custom_species)
+
+        form.addRow("Cap label", self.custom_cap_name)
+        form.addRow("Capped m/z", self.custom_capped_mz)
+        form.addRow("Capped charge z", self.custom_capped_charge)
+        form.addRow("5' T1 fragment", self.custom_fragment)
+        form.addRow("Custom ppp-fragment m/z", self.custom_ppp_mz)
+        form.addRow("Custom ppp-fragment charge z", self.custom_ppp_charge)
+        form.addRow("", self.custom_include_capped_z2)
+        form.addRow("", self.custom_include_uncapped_z2)
+        form.addRow("", self.custom_include_g_ladder)
+        form.addRow("", self.custom_g_as_denominator)
+        form.addRow("", gen_custom_btn)
+        scroll.setWidget(inner)
+        outer_layout.addWidget(scroll)
+        self.left_tabs.addTab(outer, "Custom generator")
+
+
+    def _build_composite_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        form = QFormLayout()
+
+        self.composite_auto_x = QCheckBox("Auto x-axis")
+        self.composite_auto_x.setChecked(True)
+        self.composite_x_min = QDoubleSpinBox()
+        self.composite_x_min.setDecimals(4)
+        self.composite_x_min.setRange(0.0, 1e9)
+        self.composite_x_min.setSingleStep(1.0)
+        self.composite_x_max = QDoubleSpinBox()
+        self.composite_x_max.setDecimals(4)
+        self.composite_x_max.setRange(0.0, 1e9)
+        self.composite_x_max.setSingleStep(1.0)
+
+        self.composite_auto_y = QCheckBox("Auto y-axis")
+        self.composite_auto_y.setChecked(True)
+        self.composite_y_min = QDoubleSpinBox()
+        self.composite_y_min.setDecimals(1)
+        self.composite_y_min.setRange(0.0, 1e15)
+        self.composite_y_min.setSingleStep(1000.0)
+        self.composite_y_max = QDoubleSpinBox()
+        self.composite_y_max.setDecimals(1)
+        self.composite_y_max.setRange(0.0, 1e15)
+        self.composite_y_max.setSingleStep(1000.0)
+
+        show_btn = QPushButton("Show composite EIC with selected species")
+        show_btn.clicked.connect(self.show_composite_plot)
+
+        form.addRow(self.composite_auto_x)
+        form.addRow("Composite x-min", self.composite_x_min)
+        form.addRow("Composite x-max", self.composite_x_max)
+        form.addRow(self.composite_auto_y)
+        form.addRow("Composite y-min", self.composite_y_min)
+        form.addRow("Composite y-max", self.composite_y_max)
+        layout.addLayout(form)
+        layout.addWidget(QLabel("Composite x-axis values use the current RT display unit: seconds or minutes. Leave auto enabled unless you want to hide unrelated RT regions/unwanted peaks."))
+        layout.addWidget(show_btn)
+        layout.addStretch(1)
+        self.left_tabs.addTab(tab, "Composite plot")
+
+    def _build_exports_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        export_rt_btn = QPushButton("Export RT windows CSV")
+        export_rt_btn.clicked.connect(self.export_rt_csv)
+        export_auc_btn = QPushButton("Export AUC CSV")
+        export_auc_btn.clicked.connect(self.export_auc_csv)
+        export_intensity_btn = QPushButton("Export intensity summary CSV")
+        export_intensity_btn.clicked.connect(self.export_intensity_csv)
+        export_excel_btn = QPushButton("Export Excel workbook")
+        export_excel_btn.clicked.connect(self.export_excel)
+        show_composite_btn = QPushButton("Show final composite EIC plot")
+        show_composite_btn.clicked.connect(self.show_composite_plot)
+        export_composite_btn = QPushButton("Export final composite EIC TIFF")
+        export_composite_btn.clicked.connect(self.export_composite_tiff)
+        export_tiff_btn = QPushButton("Export current EIC TIFF")
+        export_tiff_btn.clicked.connect(self.export_current_tiff)
+        export_zip_btn = QPushButton("Export all EIC TIFFs ZIP")
+        export_zip_btn.clicked.connect(self.export_tiff_zip)
+        for btn in [export_rt_btn, export_auc_btn, export_intensity_btn, export_excel_btn, show_composite_btn, export_composite_btn, export_tiff_btn, export_zip_btn]:
+            layout.addWidget(btn)
+        layout.addStretch(1)
+        self.left_tabs.addTab(tab, "Exports")
+
+    # ------------------------------------------------------------------
+    # Generic helpers
+    # ------------------------------------------------------------------
+    def _set_status(self, text: str):
+        if hasattr(self, "status_box"):
+            self.status_box.setPlainText(str(text))
+
+    def _message(self, title: str, text: str, icon=QMessageBox.Information):
+        box = QMessageBox(self)
+        box.setIcon(icon)
+        box.setWindowTitle(title)
+        box.setText(text)
+        box.exec()
+
+    def _df_to_table(self, table: QTableWidget, df: pd.DataFrame):
+        if df is None:
+            df = pd.DataFrame()
+        table.blockSignals(True)
+        table.setRowCount(len(df))
+        table.setColumnCount(len(df.columns))
+        table.setHorizontalHeaderLabels([str(c) for c in df.columns])
+        for r in range(len(df)):
+            for c, col in enumerate(df.columns):
+                val = df.iloc[r, c]
+                text = "" if pd.isna(val) else str(val)
+                table.setItem(r, c, QTableWidgetItem(text))
+        table.blockSignals(False)
+        table.resizeColumnsToContents()
+
+    def _species_table_to_df(self) -> pd.DataFrame:
+        cols = [self.species_table.horizontalHeaderItem(c).text() for c in range(self.species_table.columnCount())]
+        rows = []
+        for r in range(self.species_table.rowCount()):
+            row = {}
+            for c, col in enumerate(cols):
+                item = self.species_table.item(r, c)
+                row[col] = "" if item is None else item.text()
+            rows.append(row)
+        return pd.DataFrame(rows, columns=cols)
+
+    def _load_species_table(self, df: pd.DataFrame):
+        self.species_df = df.copy()
+        for col in SPECIES_COLUMNS:
+            if col not in self.species_df.columns:
+                self.species_df[col] = ""
+        self.species_df = self.species_df[SPECIES_COLUMNS]
+        self.species_table.blockSignals(True)
+        self.species_table.setRowCount(len(self.species_df))
+        self.species_table.setColumnCount(len(SPECIES_COLUMNS))
+        self.species_table.setHorizontalHeaderLabels(SPECIES_COLUMNS)
+        for r in range(len(self.species_df)):
+            for c, col in enumerate(SPECIES_COLUMNS):
+                val = self.species_df.iloc[r][col]
+                text = "" if pd.isna(val) else str(val)
+                self.species_table.setItem(r, c, QTableWidgetItem(text))
+        self.species_table.blockSignals(False)
+        self.species_table.resizeColumnsToContents()
+        self.session = None
+        self.refresh_species_choices()
+        self.refresh_tables()
+        self._show_blank_plot("No MS data loaded")
+
+    def _species_edited(self, _item):
+        self.session = None
+        self.refresh_species_choices()
+        self.refresh_tables()
+        self._show_blank_plot("Species table edited. Reload MS data.")
+        self._set_status("Species table edited. Click 'Load Data & Build EICs' to rebuild EICs.")
+
+    def _apply_species_df(self, df: pd.DataFrame, mode: str, message: str):
+        ok, valid, msg = validate_species_table(df)
+        if not ok:
+            self._set_status("Species validation failed:\n" + msg)
+            self._message("Species validation failed", msg, QMessageBox.Critical)
+            return
+        if mode == "append":
+            merged = pd.concat([self._species_table_to_df(), valid], ignore_index=True)
+            ok, valid, msg2 = validate_species_table(merged)
+            msg = "\n".join(x for x in [msg, msg2] if x)
+            if not ok:
+                self._message("Species validation failed", msg, QMessageBox.Critical)
+                return
+        self._load_species_table(valid)
+        self._set_status(message + ("\n" + msg if msg else ""))
+
+    # ------------------------------------------------------------------
+    # Species actions
+    # ------------------------------------------------------------------
+    def choose_ms_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Choose MS file", "", "MS files (*.mzML *.mzXML)")
+        if path:
+            self.ms_file = path
+            self.ms_label.setText(path)
+            self.session = None
+            self.refresh_tables()
+            self._show_blank_plot("MS file selected. Load data to build EICs.")
+            self._set_status("New MS file selected. Click 'Load Data & Build EICs'.")
+
+    def upload_species_table(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Upload species table", "", "Species tables (*.csv *.xlsx *.xls)")
+        if not path:
+            return
+        try:
+            raw = read_species_file(path)
+            ok, valid, msg = validate_species_table(raw)
+            if not ok:
+                raise ValueError(msg)
+            self._load_species_table(valid)
+            self._set_status("Species table uploaded and validated." + ("\n" + msg if msg else ""))
+        except Exception as exc:
+            self._message("Upload failed", str(exc), QMessageBox.Critical)
+            self._set_status("Species table upload failed:\n" + str(exc))
+
+    def save_species_template(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Save species template", "capping_species_template.csv", "CSV files (*.csv)")
+        if path:
+            species_template().to_csv(path, index=False)
+            self._set_status(f"Species template saved: {path}")
+
+    def reset_species(self):
+        self._load_species_table(default_species())
+        self._set_status("Default species table restored. Click 'Load Data & Build EICs' if data were already loaded.")
+
+    def add_species_row(self):
+        df = self._species_table_to_df()
+        new = {col: "" for col in SPECIES_COLUMNS}
+        new.update({"name": f"species_{len(df) + 1}", "type": "Capped", "use_for_efficiency": "TRUE", "source": "manual"})
+        self._load_species_table(pd.concat([df, pd.DataFrame([new])], ignore_index=True))
+        self._set_status("Species row added. Edit the row, then click 'Load Data & Build EICs'.")
+
+    def remove_selected_species_row(self):
+        row = self.species_table.currentRow()
+        if row < 0:
+            return
+        df = self._species_table_to_df().drop(index=row).reset_index(drop=True)
+        self._load_species_table(df)
+        self._set_status("Species row removed. Click 'Load Data & Build EICs' to rebuild EICs before analysis.")
+
+    def load_preset_species(self):
+        try:
+            gen = generate_preset_species(
+                preset_id=self.preset_combo.currentData(),
+                include_capped_z2=self.include_capped_z2.isChecked(),
+                include_uncapped_z2=self.include_uncapped_z2.isChecked(),
+                include_g_ladder=self.include_g_ladder.isChecked(),
+                g_use_for_efficiency=self.g_as_denominator.isChecked(),
+            )
+            self._apply_species_df(gen, self.generated_mode.currentData(), "Preset species table generated. Review denominator flags before analysis.")
+        except Exception as exc:
+            self._message("Preset generation failed", str(exc), QMessageBox.Critical)
+
+    def generate_custom_species(self):
+        try:
+            custom_ppp = self.custom_ppp_mz.value() if self.custom_ppp_mz.value() > 0 else None
+            gen = generate_custom_species(
+                custom_cap_name=self.custom_cap_name.text(),
+                capped_mz=self.custom_capped_mz.value(),
+                capped_charge=self.custom_capped_charge.value(),
+                fragment=self.custom_fragment.currentText(),
+                custom_ppp_mz=custom_ppp,
+                custom_ppp_charge=self.custom_ppp_charge.value(),
+                include_capped_z2=self.custom_include_capped_z2.isChecked(),
+                include_uncapped_z2=self.custom_include_uncapped_z2.isChecked(),
+                include_g_ladder=self.custom_include_g_ladder.isChecked(),
+                g_use_for_efficiency=self.custom_g_as_denominator.isChecked(),
+            )
+            self._apply_species_df(gen, self.generated_mode.currentData(), "Custom species table generated. Review the generated uncapped ladder before analysis.")
+        except Exception as exc:
+            self._message("Custom generation failed", str(exc), QMessageBox.Critical)
+
+    # ------------------------------------------------------------------
+    # Analysis
+    # ------------------------------------------------------------------
+    def load_ms_data(self):
+        if not self.ms_file:
+            self._message("No MS file", "Select a .mzML or .mzXML file first.", QMessageBox.Warning)
+            return
+        species = self._species_table_to_df()
+        ok, valid, msg = validate_species_table(species)
+        if not ok:
+            self._message("Species validation failed", msg, QMessageBox.Critical)
+            self._set_status("Species table validation failed:\n" + msg)
+            return
+        self.species_df = valid
+
+        progress = QProgressDialog("Loading MS file and extracting EICs...", "Cancel", 0, 100, self)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+
+        def progress_cb(frac, text):
+            progress.setValue(max(0, min(100, int(frac * 100))))
+            progress.setLabelText(text)
+            QApplication.processEvents()
+            if progress.wasCanceled():
+                raise RuntimeError("Analysis cancelled by user.")
+
+        try:
+            session, validation_msg = build_analysis(
+                self.ms_file,
+                self.species_df,
+                default_mz_tol=self.default_mz_tol.value(),
+                default_ms2_window=self.default_ms2_window.value(),
+                ms1_intensity_threshold=self.ms1_intensity_threshold.value(),
+                uncapped_percent_threshold=self.uncapped_percent_threshold.value(),
+                ignore_labile_phosphate_loss=self.ignore_labile_loss.isChecked(),
+                labile_rt_tolerance_sec=self.labile_rt_tolerance.value(),
+                progress_cb=progress_cb,
+            )
+            progress.setValue(100)
+            self.session = session
+            status_parts = ["MS file loaded and EICs built.", session.ms1_message, session.filter_message, session.uncapped_intensity_message, session.labile_loss_message]
+            if validation_msg:
+                status_parts.append(validation_msg)
+            self._set_status("\n".join(status_parts))
+            self.refresh_after_mode_change()
+        except Exception as exc:
+            progress.close()
+            self._message("Analysis failed", str(exc), QMessageBox.Critical)
+            self._set_status("Analysis failed:\n" + str(exc))
+
+    def requested_mode(self) -> str:
+        return self.mode_combo.currentData() or "filtered"
+
+    def rt_display_unit(self) -> str:
+        if not hasattr(self, "rt_unit_combo"):
+            return "seconds"
+        return self.rt_unit_combo.currentData() or "seconds"
+
+    def rt_axis_label(self) -> str:
+        return "Retention Time (minutes)" if self.rt_display_unit() == "minutes" else "Retention Time (seconds)"
+
+    def rt_seconds_to_display(self, value: float) -> float:
+        return float(value) / 60.0 if self.rt_display_unit() == "minutes" else float(value)
+
+    def rt_display_to_seconds(self, value: float) -> float:
+        return float(value) * 60.0 if self.rt_display_unit() == "minutes" else float(value)
+
+    def _current_unit_label(self) -> str:
+        return "minutes" if self.rt_display_unit() == "minutes" else "seconds"
+
+    def _update_rt_spin_labels(self):
+        if hasattr(self, "numeric_rt_label"):
+            self.numeric_rt_label.setText(f"Manual RT window ({self._current_unit_label()})")
+
+    def _set_numeric_rt_window_from_seconds(self, rt_window):
+        if not hasattr(self, "numeric_rt_min"):
+            return
+        self.numeric_rt_min.blockSignals(True)
+        self.numeric_rt_max.blockSignals(True)
+        try:
+            if rt_window is None:
+                self.numeric_rt_min.setValue(0.0)
+                self.numeric_rt_max.setValue(0.0)
+            else:
+                lo, hi = sorted([float(rt_window[0]), float(rt_window[1])])
+                if self.rt_display_unit() == "minutes":
+                    lo, hi = lo / 60.0, hi / 60.0
+                self.numeric_rt_min.setValue(lo)
+                self.numeric_rt_max.setValue(hi)
+        finally:
+            self.numeric_rt_min.blockSignals(False)
+            self.numeric_rt_max.blockSignals(False)
+
+    def _composite_axis_ranges(self):
+        x_range = None
+        y_range = None
+        if hasattr(self, "composite_auto_x") and not self.composite_auto_x.isChecked():
+            x0 = float(self.composite_x_min.value())
+            x1 = float(self.composite_x_max.value())
+            if x1 > x0:
+                x_range = [x0, x1]
+        if hasattr(self, "composite_auto_y") and not self.composite_auto_y.isChecked():
+            y0 = float(self.composite_y_min.value())
+            y1 = float(self.composite_y_max.value())
+            if y1 > y0:
+                y_range = [y0, y1]
+        return x_range, y_range
+
+    def refresh_rt_unit_views(self):
+        self._update_rt_spin_labels()
+        self.plot_selected_species()
+
+    def refresh_after_mode_change(self):
+        self.refresh_species_choices()
+        self.refresh_tables()
+        self.plot_selected_species()
+
+    def refresh_species_choices(self):
+        if not hasattr(self, "selected_species_combo"):
+            return
+        self.selected_species_combo.blockSignals(True)
+        self.selected_species_combo.clear()
+        if self.session and self.session.loaded:
+            state = self.session.state(self.requested_mode())
+            for name in state.species_table["name"].astype(str).tolist():
+                self.selected_species_combo.addItem(name)
+        self.selected_species_combo.blockSignals(False)
+
+    def refresh_tables(self):
+        if not hasattr(self, "rt_table"):
+            return
+        if self.session and self.session.loaded:
+            state = self.session.state(self.requested_mode())
+            self._df_to_table(self.rt_table, state.rt_windows)
+            tbl = auc_table(self.session, self.requested_mode())
+            self._df_to_table(self.auc_table_widget, tbl)
+            self._df_to_table(self.intensity_table_widget, intensity_table(self.session, self.requested_mode()))
+            self._populate_selection_table(tbl)
+            eff = calculate_efficiency(
+                tbl,
+                honor_use_for_efficiency=True,
+                ignore_not_found=self.ignore_not_found_species.isChecked(),
+                allow_bounded_efficiency=self.allow_bounded_efficiency.isChecked(),
+                combine_capped_charge_states=self.combine_capped_charges.isChecked(),
+            )
+            self.efficiency_box.setPlainText(str(eff.get("message", "")))
+        else:
+            self._df_to_table(self.rt_table, pd.DataFrame({"Message": ["No MS data loaded."]}))
+            self._df_to_table(self.auc_table_widget, pd.DataFrame({"Message": ["No AUC table available."]}))
+            self._df_to_table(self.intensity_table_widget, pd.DataFrame({"Message": ["No intensity summary available."]}))
+            self._df_to_table(self.selection_table, pd.DataFrame({"Message": ["No species selection available."]}))
+            self.efficiency_box.setPlainText("No MS data loaded.")
+
+    def _populate_selection_table(self, tbl: pd.DataFrame):
+        if not hasattr(self, "selection_table"):
+            return
+        if tbl is None or len(tbl) == 0:
+            self._df_to_table(self.selection_table, pd.DataFrame({"Message": ["No species selection available."]}))
+            return
+        cols = ["Include", "Species", "type", "species_detection_status", "AUC", "MS1_max_intensity"]
+        self._updating_selection_table = True
+        self.selection_table.blockSignals(True)
+        self.selection_table.setRowCount(len(tbl))
+        self.selection_table.setColumnCount(len(cols))
+        self.selection_table.setHorizontalHeaderLabels(cols)
+        for r, (_, row) in enumerate(tbl.iterrows()):
+            include_raw = row.get("use_for_efficiency", True)
+            include = str(include_raw).strip().lower() in {"true", "1", "yes", "y", "include", "included"}
+            item = QTableWidgetItem("")
+            item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            item.setCheckState(Qt.Checked if include else Qt.Unchecked)
+            self.selection_table.setItem(r, 0, item)
+            values = [
+                str(row.get("Species", "")),
+                str(row.get("type", "")),
+                str(row.get("species_detection_status", "")),
+                "" if pd.isna(row.get("AUC", pd.NA)) else str(row.get("AUC")),
+                "" if pd.isna(row.get("MS1_max_intensity", pd.NA)) else str(row.get("MS1_max_intensity")),
+            ]
+            for c, val in enumerate(values, start=1):
+                cell = QTableWidgetItem(val)
+                cell.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                self.selection_table.setItem(r, c, cell)
+        self.selection_table.blockSignals(False)
+        self._updating_selection_table = False
+        self.selection_table.resizeColumnsToContents()
+
+    def selection_table_changed(self, item: QTableWidgetItem):
+        if self._updating_selection_table or item is None or item.column() != 0:
+            return
+        species_item = self.selection_table.item(item.row(), 1)
+        if species_item is None:
+            return
+        species = species_item.text()
+        include = item.checkState() == Qt.Checked
+        self.set_species_inclusion(species, include, refresh=True)
+
+    def set_species_inclusion(self, species: str, include: bool, refresh: bool = True):
+        """Set use_for_efficiency for one species without forcing MS-data reload.
+
+        This is the user-facing way to ignore unwanted species/signals from the
+        efficiency calculation and final composite plot. It updates the source
+        species table and any already-loaded all/filtered session tables.
+        """
+        species = str(species)
+        include_bool = bool(include)
+        if self.species_df is not None and "name" in self.species_df.columns:
+            self.species_df.loc[self.species_df["name"].astype(str) == species, "use_for_efficiency"] = include_bool
+        if hasattr(self, "species_table"):
+            self.species_table.blockSignals(True)
+            try:
+                name_col = SPECIES_COLUMNS.index("name") if "name" in SPECIES_COLUMNS else 0
+                use_col = SPECIES_COLUMNS.index("use_for_efficiency") if "use_for_efficiency" in SPECIES_COLUMNS else None
+                if use_col is not None:
+                    for r in range(self.species_table.rowCount()):
+                        item = self.species_table.item(r, name_col)
+                        if item is not None and item.text() == species:
+                            self.species_table.setItem(r, use_col, QTableWidgetItem("TRUE" if include_bool else "FALSE"))
+            finally:
+                self.species_table.blockSignals(False)
+        if self.session is not None:
+            for state in [self.session.all, self.session.filtered]:
+                if state.species_table is not None and "name" in state.species_table.columns:
+                    mask = state.species_table["name"].astype(str) == species
+                    if mask.any():
+                        state.species_table.loc[mask, "use_for_efficiency"] = include_bool
+        if refresh:
+            self.refresh_tables()
+            self._set_status(f"Species {'included' if include_bool else 'ignored'} for efficiency and final composite plot: {species}")
+
+    # ------------------------------------------------------------------
+    # Plotly EIC view and RT-window saving
+    # ------------------------------------------------------------------
+    def _plotly_html(self, eic: pd.DataFrame, species: str, rt_window=None, rt_unit: str = "seconds") -> str:
+        import plotly.graph_objects as go
+
+        fig = go.Figure()
+        if eic is not None and len(eic) > 0:
+            fig.add_trace(
+                go.Scatter(
+                    x=(pd.to_numeric(eic["RT"], errors="coerce") / 60.0) if rt_unit == "minutes" else pd.to_numeric(eic["RT"], errors="coerce"),
+                    y=pd.to_numeric(eic["Intensity"], errors="coerce"),
+                    mode="lines+markers",
+                    name=species,
+                    marker={"size": 5},
+                    line={"width": 1.5},
+                )
+            )
+        if rt_window is not None:
+            lo, hi = sorted([float(rt_window[0]), float(rt_window[1])])
+            if rt_unit == "minutes":
+                lo, hi = lo / 60.0, hi / 60.0
+            fig.add_vrect(x0=lo, x1=hi, fillcolor="LightSkyBlue", opacity=0.25, line_width=0)
+        fig.update_layout(
+            template="plotly_white",
+            title=f"EIC for {species}",
+            xaxis_title="Retention Time (minutes)" if rt_unit == "minutes" else "Retention Time (seconds)",
+            yaxis_title="Intensity",
+            xaxis={"rangeslider": {"visible": True}},
+            dragmode="select",
+            hovermode="closest",
+            margin={"l": 70, "r": 25, "t": 55, "b": 60},
+            modebar_add=["select2d", "lasso2d"],
+        )
+        html = fig.to_html(include_plotlyjs=True, full_html=True, config={"displaylogo": False, "displayModeBar": True})
+        js = r"""
+<script>
+window.__selectedRTWindow = null;
+function attachSelectionHandler(){
+  const gd = document.querySelector('.plotly-graph-div');
+  if(!gd || !gd.on){ setTimeout(attachSelectionHandler, 100); return; }
+  gd.on('plotly_selected', function(eventData){
+    if(eventData && eventData.points && eventData.points.length >= 2){
+      const xs = eventData.points.map(p => Number(p.x)).filter(x => Number.isFinite(x));
+      if(xs.length >= 2){
+        window.__selectedRTWindow = [Math.min.apply(null, xs), Math.max.apply(null, xs)];
+      }
+    }
+  });
+  gd.on('plotly_deselect', function(){ window.__selectedRTWindow = null; });
+}
+attachSelectionHandler();
+</script>
+"""
+        return html.replace("</body>", js + "\n</body>")
+
+
+    def _load_html_in_plot_view(self, html_text: str):
+        """Load HTML through a local file instead of setHtml().
+
+        QWebEngineView.setHtml() internally uses a data URL in many Qt builds.
+        Large inline Plotly HTML can exceed that path and silently fail, leaving the
+        old blank page visible. A temporary local file avoids that limitation and is
+        more reliable after PyInstaller packaging.
+        """
+        if not WEBENGINE_AVAILABLE:
+            return
+        self._plot_counter += 1
+        path = self._plot_temp_dir / f"eic_plot_{self._plot_counter:04d}.html"
+        path.write_text(html_text, encoding="utf-8")
+        self.plot_view.load(QUrl.fromLocalFile(str(path)))
+
+    def _show_blank_plot(self, message: str):
+        if not hasattr(self, "plot_view"):
+            return
+        if WEBENGINE_AVAILABLE:
+            escaped_message = html_lib.escape(str(message))
+            html = f"""
+<!doctype html>
+<html><body style="font-family: Arial, sans-serif; background: white; color: #222;">
+<div style="height: 80vh; display: flex; align-items: center; justify-content: center; border: 1px solid #ddd;">
+  <div style="text-align: center; font-size: 20px;">{escaped_message}</div>
+</div>
+<script>window.__selectedRTWindow = null;</script>
+</body></html>
+"""
+            self._load_html_in_plot_view(html)
+        else:
+            self.plot_view.setPlainText(message)
+
+    def plot_selected_species(self):
+        if not hasattr(self, "plot_view"):
+            return
+        if not (self.session and self.session.loaded) or self.selected_species_combo.count() == 0:
+            self._show_blank_plot("No MS data loaded")
+            return
+        species = self.selected_species_combo.currentText()
+        state = self.session.state(self.requested_mode())
+        eic = state.eic_list.get(species, pd.DataFrame())
+        rt_window = None
+        if state.rt_windows is not None and len(state.rt_windows) > 0:
+            row = state.rt_windows[state.rt_windows["Species"].astype(str) == species]
+            if len(row) == 1 and pd.notna(row.iloc[0]["RTmin"]) and pd.notna(row.iloc[0]["RTmax"]):
+                rt_window = (float(row.iloc[0]["RTmin"]), float(row.iloc[0]["RTmax"]))
+        self._set_numeric_rt_window_from_seconds(rt_window)
+        if WEBENGINE_AVAILABLE:
+            try:
+                self._load_html_in_plot_view(self._plotly_html(eic, species, rt_window=rt_window, rt_unit=self.rt_display_unit()))
+            except Exception as exc:
+                self._show_blank_plot("EIC plot failed to render")
+                self._set_status("EIC plot failed to render:\n" + str(exc))
+        else:
+            self.plot_view.setPlainText("Qt WebEngine is unavailable. Rebuild with PySide6 QtWebEngine support.")
+
+    def save_numeric_window(self):
+        if not (self.session and self.session.loaded):
+            self._message("No data", "Load MS data first.", QMessageBox.Warning)
+            return
+        try:
+            species = self.selected_species_combo.currentText()
+            if not species:
+                raise ValueError("No species selected.")
+            x_min = float(self.numeric_rt_min.value())
+            x_max = float(self.numeric_rt_max.value())
+            if x_min == x_max:
+                raise ValueError("RT min and RT max cannot be the same.")
+            rt_min, rt_max = self.rt_display_to_seconds(x_min), self.rt_display_to_seconds(x_max)
+            min_i = self.auc_min_intensity.value()
+            min_pts = self.min_consecutive_points.value()
+            auc = save_rt_window(self.session, self.requested_mode(), species, rt_min, rt_max, min_intensity=min_i, min_consecutive_points=min_pts)
+            self.refresh_tables()
+            tbl_now = auc_table(self.session, self.requested_mode())
+            status = ""
+            if tbl_now is not None and len(tbl_now) > 0:
+                row = tbl_now.loc[tbl_now["Species"].astype(str) == str(species)]
+                if len(row) == 1:
+                    status = str(row.iloc[0].get("species_detection_status", ""))
+            auc_text = f"AUC = {float(auc):.4g}" if pd.notna(auc) else "AUC not assigned; species not found beyond selected limits"
+            self._set_status(
+                f"Numeric RT window for {species} saved: [{x_min:.4g}, {x_max:.4g}] {self._current_unit_label()} "
+                f"([{min(rt_min, rt_max):.2f}, {max(rt_min, rt_max):.2f}] seconds); {auc_text}. Status: {status}"
+            )
+            self.plot_selected_species()
+        except Exception as exc:
+            self._message("Could not save numeric RT window", str(exc), QMessageBox.Critical)
+
+    def save_selected_window(self):
+        if not (self.session and self.session.loaded):
+            self._message("No data", "Load MS data first.", QMessageBox.Warning)
+            return
+        if not WEBENGINE_AVAILABLE:
+            self._message("Plot selection unavailable", "Qt WebEngine is unavailable in this build.", QMessageBox.Warning)
+            return
+        self.plot_view.page().runJavaScript("JSON.stringify(window.__selectedRTWindow || null)", self._save_selected_window_from_js)
+
+    def _save_selected_window_from_js(self, result):
+        try:
+            if result in (None, "null", ""):
+                self._message(
+                    "No RT window selected",
+                    "Use the Plotly box or lasso select tool on the EIC, then click 'Save selected RT window'.",
+                    QMessageBox.Warning,
+                )
+                return
+            selected = json.loads(result)
+            if not isinstance(selected, list) or len(selected) != 2:
+                raise ValueError("Invalid selection returned from Plotly.")
+            x_min, x_max = float(selected[0]), float(selected[1])
+            if x_min == x_max:
+                raise ValueError("Selection has zero width.")
+            rt_min, rt_max = self.rt_display_to_seconds(x_min), self.rt_display_to_seconds(x_max)
+            species = self.selected_species_combo.currentText()
+            min_i = self.auc_min_intensity.value()
+            min_pts = self.min_consecutive_points.value()
+            auc = save_rt_window(self.session, self.requested_mode(), species, rt_min, rt_max, min_intensity=min_i, min_consecutive_points=min_pts)
+            unit_label = "minutes" if self.rt_display_unit() == "minutes" else "seconds"
+            self.refresh_tables()
+            tbl_now = auc_table(self.session, self.requested_mode())
+            status = ""
+            if tbl_now is not None and len(tbl_now) > 0:
+                row = tbl_now.loc[tbl_now["Species"].astype(str) == str(species)]
+                if len(row) == 1:
+                    status = str(row.iloc[0].get("species_detection_status", ""))
+            if pd.notna(auc):
+                auc_text = f"AUC = {float(auc):.4g}"
+            else:
+                auc_text = "AUC not assigned; species not found beyond selected limits"
+            self._set_status(
+                f"Window for {species} saved: [{x_min:.3f}, {x_max:.3f}] {unit_label} "
+                f"([{min(rt_min, rt_max):.2f}, {max(rt_min, rt_max):.2f}] seconds); "
+                f"{auc_text}; included points Intensity > {min_i:.4g}; min contiguous points = {min_pts}. "
+                f"Status: {status}"
+            )
+            self.plot_selected_species()
+        except Exception as exc:
+            self._message("Could not save RT window", str(exc), QMessageBox.Critical)
+
+
+    def _composite_plotly_html(self, rt_unit: str = "seconds") -> str:
+        import plotly.graph_objects as go
+
+        eic_map, plot_tbl = composite_eic_data(
+            self.session,
+            self.requested_mode(),
+            combine_capped_charge_states=self.combine_capped_charges.isChecked(),
+        )
+        if plot_tbl is None or len(plot_tbl) == 0:
+            return self._blank_html("No species available for composite plot")
+        fig = go.Figure()
+        for _, row in plot_tbl.iterrows():
+            species = str(row["Species"])
+            eic = eic_map.get(species, pd.DataFrame())
+            if eic is None or len(eic) == 0:
+                continue
+            x = pd.to_numeric(eic["RT"], errors="coerce") / 60.0 if rt_unit == "minutes" else pd.to_numeric(eic["RT"], errors="coerce")
+            label = f"{species} ({row.get('type', '')})"
+            if bool(row.get("combined_capped_charge_states", False)):
+                label = f"{species} ({row.get('type', '')}; summed charges)"
+            fig.add_trace(go.Scatter(
+                x=x,
+                y=pd.to_numeric(eic["Intensity"], errors="coerce"),
+                mode="lines",
+                name=label,
+                line={"width": 1.8 if row.get('type', '') == 'Capped' else 1.4},
+            ))
+            if pd.notna(row.get("RTmin", pd.NA)) and pd.notna(row.get("RTmax", pd.NA)):
+                lo, hi = sorted([float(row["RTmin"]), float(row["RTmax"])])
+                if rt_unit == "minutes":
+                    lo, hi = lo / 60.0, hi / 60.0
+                fig.add_vrect(x0=lo, x1=hi, fillcolor="LightSkyBlue", opacity=0.08, line_width=0)
+        title = "Composite EIC plot: included capped and uncapped species"
+        if self.combine_capped_charges.isChecked():
+            title += " — capped charge states summed"
+        x_range, y_range = self._composite_axis_ranges()
+        xaxis_cfg = {"rangeslider": {"visible": True}}
+        if x_range is not None:
+            xaxis_cfg["range"] = x_range
+        yaxis_cfg = {}
+        if y_range is not None:
+            yaxis_cfg["range"] = y_range
+        fig.update_layout(
+            template="plotly_white",
+            title=title,
+            xaxis_title="Retention Time (minutes)" if rt_unit == "minutes" else "Retention Time (seconds)",
+            yaxis_title="Intensity",
+            xaxis=xaxis_cfg,
+            yaxis=yaxis_cfg,
+            hovermode="closest",
+            margin={"l": 70, "r": 25, "t": 55, "b": 60},
+        )
+        html = fig.to_html(include_plotlyjs=True, full_html=True, config={"displaylogo": False, "displayModeBar": True})
+        return html.replace("</body>", "<script>window.__selectedRTWindow = null;</script>\n</body>")
+
+    def _blank_html(self, message: str) -> str:
+        escaped_message = html_lib.escape(str(message))
+        return f"""
+<!doctype html>
+<html><body style="font-family: Arial, sans-serif; background: white; color: #222;">
+<div style="height: 80vh; display: flex; align-items: center; justify-content: center; border: 1px solid #ddd;">
+  <div style="text-align: center; font-size: 20px;">{escaped_message}</div>
+</div>
+<script>window.__selectedRTWindow = null;</script>
+</body></html>
+"""
+
+    def show_composite_plot(self):
+        if not self._require_session():
+            return
+        if WEBENGINE_AVAILABLE:
+            try:
+                self._load_html_in_plot_view(self._composite_plotly_html(rt_unit=self.rt_display_unit()))
+                if self.combine_capped_charges.isChecked():
+                    self._set_status("Composite EIC plot shown using selected/included species only. Capped z=1/z=2 traces with matching neutral mass are summed when the combine option is enabled.")
+                else:
+                    self._set_status("Composite EIC plot shown using selected/included species only. Unwanted species can be unchecked in the Analysis/plot selection table.")
+            except Exception as exc:
+                self._show_blank_plot("Composite plot failed to render")
+                self._set_status("Composite plot failed to render:\n" + str(exc))
+        else:
+            self.plot_view.setPlainText("Qt WebEngine is unavailable. Rebuild with PySide6 QtWebEngine support.")
+
+    # ------------------------------------------------------------------
+    # Exports
+    # ------------------------------------------------------------------
+    def _require_session(self) -> bool:
+        if not (self.session and self.session.loaded):
+            self._message("No data", "Load MS data first.", QMessageBox.Warning)
+            return False
+        return True
+
+    def export_rt_csv(self):
+        if not self._require_session():
+            return
+        mode = self.session.current_mode(self.requested_mode())
+        stem = Path(self.ms_file).stem if self.ms_file else "rt_windows"
+        path, _ = QFileDialog.getSaveFileName(self, "Export RT windows", f"{stem}_{mode}_rt_windows.csv", "CSV files (*.csv)")
+        if path:
+            export_csv(self.session.state(self.requested_mode()).rt_windows, path)
+            self._set_status(f"RT windows exported: {path}")
+
+    def export_auc_csv(self):
+        if not self._require_session():
+            return
+        mode = self.session.current_mode(self.requested_mode())
+        stem = Path(self.ms_file).stem if self.ms_file else "auc_table"
+        path, _ = QFileDialog.getSaveFileName(self, "Export AUC table", f"{stem}_{mode}_auc_table.csv", "CSV files (*.csv)")
+        if path:
+            export_csv(auc_table(self.session, self.requested_mode()), path)
+            self._set_status(f"AUC table exported: {path}")
+
+    def export_intensity_csv(self):
+        if not self._require_session():
+            return
+        mode = self.session.current_mode(self.requested_mode())
+        stem = Path(self.ms_file).stem if self.ms_file else "intensity_summary"
+        path, _ = QFileDialog.getSaveFileName(self, "Export intensity summary", f"{stem}_{mode}_intensity_summary.csv", "CSV files (*.csv)")
+        if path:
+            export_csv(intensity_table(self.session, self.requested_mode()), path)
+            self._set_status(f"Intensity summary exported: {path}")
+
+    def export_excel(self):
+        if not self._require_session():
+            return
+        mode = self.session.current_mode(self.requested_mode())
+        stem = Path(self.ms_file).stem if self.ms_file else "capping_efficiency"
+        path, _ = QFileDialog.getSaveFileName(self, "Export Excel workbook", f"{stem}_{mode}_capping_efficiency.xlsx", "Excel files (*.xlsx)")
+        if path:
+            export_excel_workbook(
+                self.session,
+                self.requested_mode(),
+                path,
+                ignore_not_found=self.ignore_not_found_species.isChecked(),
+                allow_bounded_efficiency=self.allow_bounded_efficiency.isChecked(),
+                combine_capped_charge_states=self.combine_capped_charges.isChecked(),
+            )
+            self._set_status(f"Excel workbook exported: {path}")
+
+
+    def export_composite_tiff(self):
+        if not self._require_session():
+            return
+        mode = self.session.current_mode(self.requested_mode())
+        stem = Path(self.ms_file).stem if self.ms_file else "composite_eic"
+        path, _ = QFileDialog.getSaveFileName(self, "Export final composite EIC TIFF", f"{stem}_{mode}_composite_EIC.tiff", "TIFF files (*.tiff *.tif)")
+        if path:
+            export_composite_eic_tiff(
+                self.session,
+                self.requested_mode(),
+                path,
+                rt_unit=self.rt_display_unit(),
+                combine_capped_charge_states=self.combine_capped_charges.isChecked(),
+                x_range_display=self._composite_axis_ranges()[0],
+                y_range=self._composite_axis_ranges()[1],
+            )
+            self._set_status(f"Composite EIC TIFF exported: {path}")
+
+    def export_current_tiff(self):
+        if not self._require_session():
+            return
+        species = self.selected_species_combo.currentText()
+        path, _ = QFileDialog.getSaveFileName(self, "Export current EIC TIFF", f"{safe_filename(species)}_EIC.tiff", "TIFF files (*.tiff *.tif)")
+        if path:
+            export_current_eic_tiff(self.session, self.requested_mode(), species, path, rt_unit=self.rt_display_unit())
+            self._set_status(f"Current EIC TIFF exported: {path}")
+
+    def export_tiff_zip(self):
+        if not self._require_session():
+            return
+        mode = self.session.current_mode(self.requested_mode())
+        stem = Path(self.ms_file).stem if self.ms_file else "eic_plots"
+        path, _ = QFileDialog.getSaveFileName(self, "Export all EIC TIFFs ZIP", f"{stem}_{mode}_EIC_plots.zip", "ZIP files (*.zip)")
+        if path:
+            export_all_eic_tiffs_zip(self.session, self.requested_mode(), path, rt_unit=self.rt_display_unit())
+            self._set_status(f"EIC TIFF ZIP exported: {path}")
+
+
+def apply_light_palette(app: QApplication):
+    app.setStyle("Fusion")
+    palette = QPalette()
+    palette.setColor(QPalette.Window, QColor(245, 245, 245))
+    palette.setColor(QPalette.WindowText, QColor(0, 0, 0))
+    palette.setColor(QPalette.Base, QColor(255, 255, 255))
+    palette.setColor(QPalette.AlternateBase, QColor(240, 240, 240))
+    palette.setColor(QPalette.ToolTipBase, QColor(255, 255, 220))
+    palette.setColor(QPalette.ToolTipText, QColor(0, 0, 0))
+    palette.setColor(QPalette.Text, QColor(0, 0, 0))
+    palette.setColor(QPalette.Button, QColor(245, 245, 245))
+    palette.setColor(QPalette.ButtonText, QColor(0, 0, 0))
+    palette.setColor(QPalette.BrightText, QColor(255, 0, 0))
+    palette.setColor(QPalette.Highlight, QColor(40, 110, 180))
+    palette.setColor(QPalette.HighlightedText, QColor(255, 255, 255))
+    app.setPalette(palette)
+
+
+def main():
+    app = QApplication(sys.argv)
+    apply_light_palette(app)
+    win = CappingEfficiencyWindow()
+    win.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
